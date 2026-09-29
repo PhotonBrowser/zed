@@ -15,7 +15,7 @@ use crate::{
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    LiveImage, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
@@ -100,6 +100,21 @@ pub enum DispatchPhase {
     /// you stop event propagation during this phase, you need to know what you're doing. Handlers
     /// outside of the immediate region may rely on detecting non-local events during this phase.
     Capture,
+}
+
+/// Timing for one native window frame.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowFrameTiming {
+    /// Time spent laying out and painting the GPUI scene.
+    pub draw: Duration,
+    /// Time spent obtaining or uploading image atlas entries during draw.
+    pub image_atlas: Duration,
+    /// Time spent submitting the scene to the platform window.
+    pub present: Duration,
+    /// Image pixel uploads performed while painting the scene.
+    pub image_uploads: u64,
+    /// Atlas tile allocations or replacements performed while painting.
+    pub image_recreations: u64,
 }
 
 impl DispatchPhase {
@@ -1151,6 +1166,7 @@ pub struct Window {
     is_resizable: bool,
     is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
+    live_image_versions: FxHashMap<crate::ImageId, (u64, Size<DevicePixels>)>,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -1176,6 +1192,12 @@ pub struct Window {
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
+    present_callbacks: Vec<Box<dyn FnOnce(Duration)>>,
+    frame_timing_callbacks: Vec<Box<dyn FnOnce(WindowFrameTiming)>>,
+    frame_draw_started: Option<Instant>,
+    frame_image_atlas_time: Duration,
+    frame_image_uploads: u64,
+    frame_image_recreations: u64,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
@@ -1840,6 +1862,7 @@ impl Window {
             is_resizable,
             is_minimizable,
             sprite_atlas,
+            live_image_versions: FxHashMap::default(),
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -1857,6 +1880,12 @@ impl Window {
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
+            present_callbacks: Vec::new(),
+            frame_timing_callbacks: Vec::new(),
+            frame_draw_started: None,
+            frame_image_atlas_time: Duration::ZERO,
+            frame_image_uploads: 0,
+            frame_image_recreations: 0,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
@@ -2913,6 +2942,10 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        self.frame_draw_started = Some(Instant::now());
+        self.frame_image_atlas_time = Duration::ZERO;
+        self.frame_image_uploads = 0;
+        self.frame_image_recreations = 0;
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -3083,7 +3116,16 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        let present_started = Instant::now();
         self.platform_window.draw(&self.rendered_frame.scene);
+        let present_duration = present_started.elapsed();
+        let timing = WindowFrameTiming {
+            draw: self.frame_draw_started.take().map_or(Duration::ZERO, |started| started.elapsed()),
+            image_atlas: std::mem::take(&mut self.frame_image_atlas_time),
+            present: present_duration,
+            image_uploads: std::mem::take(&mut self.frame_image_uploads),
+            image_recreations: std::mem::take(&mut self.frame_image_recreations),
+        };
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -3092,7 +3134,24 @@ impl Window {
             !self.next_frame_callbacks.borrow().is_empty(),
         );
         self.needs_present.set(false);
+        for callback in std::mem::take(&mut self.present_callbacks) {
+            callback(present_duration);
+        }
+        for callback in std::mem::take(&mut self.frame_timing_callbacks) {
+            callback(timing);
+        }
         profiling::finish_frame!();
+    }
+
+    /// Observe the next platform frame submission. The callback receives the
+    /// time spent submitting the rendered scene to the platform window.
+    pub fn on_present(&mut self, callback: impl FnOnce(Duration) + 'static) {
+        self.present_callbacks.push(Box::new(callback));
+    }
+
+    /// Observe the next native frame with scene, image-atlas, and submission timings.
+    pub fn on_frame_timing(&mut self, callback: impl FnOnce(WindowFrameTiming) + 'static) {
+        self.frame_timing_callbacks.push(Box::new(callback));
     }
 
     /// Presents the current scene again without drawing or invalidating views.
@@ -4596,6 +4655,74 @@ impl Window {
         )
     }
 
+    /// Paint a mutable BGRA image using one stable atlas identity. Updating the
+    /// image uploads its pixels into the existing atlas tile when dimensions
+    /// are unchanged.
+    pub fn paint_live_image(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        image: Arc<LiveImage>,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+        if bounds.size.width <= Pixels::ZERO || bounds.size.height <= Pixels::ZERO {
+            return Ok(());
+        }
+        let visible_bounds = bounds.intersect(&bounds);
+        let params = RenderImageParams { image_id: image.id, frame_index: 0 };
+        let key = params.into();
+        let upload_started = Instant::now();
+        let tile = image.with_pixels(|width, height, revision, bytes| {
+            let image_size = size(DevicePixels(width as i32), DevicePixels(height as i32));
+            let mut inserted = false;
+            let existing = self.sprite_atlas.get_or_insert_with(&key, &mut || {
+                inserted = true;
+                Ok(Some((image_size, Cow::Borrowed(bytes))))
+            })?;
+            let Some(previous_tile) = existing else {
+                anyhow::bail!("live image atlas did not provide an image tile");
+            };
+            let previous = self.live_image_versions.get(&image.id).copied();
+            let changed = previous.map_or(true, |(previous_revision, _)| previous_revision != revision);
+            let resized = previous.is_some_and(|(_, previous_size)| previous_size != image_size);
+            let updated_tile = if inserted || !changed {
+                previous_tile
+            } else {
+                self.sprite_atlas.update(&key, image_size, bytes)?
+                    .ok_or_else(|| anyhow!("live image atlas update did not provide an image tile"))?
+            };
+            if inserted || changed {
+                self.frame_image_uploads += 1;
+            }
+            if inserted || resized || updated_tile != previous_tile {
+                self.frame_image_recreations += 1;
+            }
+            self.live_image_versions.insert(image.id, (revision, image_size));
+            Ok::<_, anyhow::Error>(updated_tile)
+        })?;
+        self.frame_image_atlas_time += upload_started.elapsed();
+
+        let visible_bounds = self.snap_bounds(visible_bounds);
+        let corner_radii = corner_radii.clamp_radii_for_quad_size(bounds.size).scale(self.scale_factor());
+        self.next_frame.scene.insert_primitive(PolychromeSprite {
+            order: 0,
+            nearest_neighbor: false.into(),
+            grayscale: false.into(),
+            bounds: visible_bounds,
+            content_mask: self.snapped_content_mask(),
+            corner_radii,
+            tile,
+            opacity: self.element_opacity(),
+        });
+        Ok(())
+    }
+
+    /// Remove the atlas tile owned by a mutable image.
+    pub fn drop_live_image(&mut self, image: &LiveImage) {
+        self.sprite_atlas.remove(&RenderImageParams { image_id: image.id, frame_index: 0 }.into());
+        self.live_image_versions.remove(&image.id);
+    }
+
     /// Paint an image with nearest-neighbor sampling.
     pub fn paint_image_nearest(
         &mut self,
@@ -4642,6 +4769,7 @@ impl Window {
             frame_index,
         };
 
+        let image_lookup_started = Instant::now();
         let tile = self
             .sprite_atlas
             .get_or_insert_with(&params.into(), &mut || {
@@ -4654,6 +4782,7 @@ impl Window {
                 )))
             })?
             .expect("Callback above only returns Some");
+        self.frame_image_atlas_time += image_lookup_started.elapsed();
 
         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
 

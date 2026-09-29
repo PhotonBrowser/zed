@@ -59,10 +59,8 @@ impl Eq for RenderImage {}
 impl RenderImage {
     /// Create a new image from the given data.
     pub fn new(data: impl Into<SmallVec<[Frame; 1]>>) -> Self {
-        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-
         Self {
-            id: ImageId(NEXT_ID.fetch_add(1, SeqCst)),
+            id: next_image_id(),
             scale_factor: 1.0,
             data: data.into(),
         }
@@ -110,6 +108,74 @@ impl RenderImage {
     pub fn frame_count(&self) -> usize {
         self.data.len()
     }
+}
+
+/// A single-frame BGRA image whose pixels can be replaced while its identity
+/// stays stable. Intended for native surfaces that update frequently.
+pub struct LiveImage {
+    pub(crate) id: ImageId,
+    frame: std::sync::Mutex<LiveImageFrame>,
+}
+
+struct LiveImageFrame {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+    revision: u64,
+}
+
+impl LiveImage {
+    /// Create an empty BGRA surface. Pixel storage is allocated once and is
+    /// resized only when the surface dimensions change.
+    pub fn new(width: u32, height: u32) -> Option<Self> {
+        let length = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+        Some(Self {
+            id: next_image_id(),
+            frame: std::sync::Mutex::new(LiveImageFrame {
+                width,
+                height,
+                pixels: vec![0; length],
+                revision: 0,
+            }),
+        })
+    }
+
+    /// Copy a strided BGRA frame into the existing backing allocation.
+    pub fn update_bgra(&self, width: u32, height: u32, stride: usize, bytes: &[u8]) -> bool {
+        let Some(row_bytes) = (width as usize).checked_mul(4) else { return false };
+        let Some(source_length) = stride.checked_mul(height as usize) else { return false };
+        let Some(packed_length) = row_bytes.checked_mul(height as usize) else { return false };
+        if stride < row_bytes || bytes.len() < source_length { return false; }
+        let mut frame = self.frame.lock().unwrap();
+        if frame.width != width || frame.height != height || frame.pixels.len() != packed_length {
+            frame.width = width;
+            frame.height = height;
+            frame.pixels.resize(packed_length, 0);
+        }
+        for row in 0..height as usize {
+            let source_start = row * stride;
+            let target_start = row * row_bytes;
+            frame.pixels[target_start..target_start + row_bytes]
+                .copy_from_slice(&bytes[source_start..source_start + row_bytes]);
+        }
+        frame.revision = frame.revision.wrapping_add(1);
+        true
+    }
+
+    /// Capacity of the owned BGRA backing allocation, in bytes.
+    pub fn byte_capacity(&self) -> usize {
+        self.frame.lock().unwrap().pixels.capacity()
+    }
+
+    pub(crate) fn with_pixels<R>(&self, f: impl FnOnce(u32, u32, u64, &[u8]) -> R) -> R {
+        let frame = self.frame.lock().unwrap();
+        f(frame.width, frame.height, frame.revision, &frame.pixels)
+    }
+}
+
+fn next_image_id() -> ImageId {
+    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+    ImageId(NEXT_ID.fetch_add(1, SeqCst))
 }
 
 impl fmt::Debug for RenderImage {
