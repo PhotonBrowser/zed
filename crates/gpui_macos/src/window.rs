@@ -11,8 +11,9 @@ use cocoa::{
     appkit::{
         NSApplication, NSBackingStoreBuffered, NSColor, NSEvent, NSEventModifierFlags, NSEventType,
         NSFilenamesPboardType, NSPasteboard, NSRequestUserAttentionType, NSScreen, NSView,
-        NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectMaterial, NSVisualEffectState,
-        NSVisualEffectView, NSWindow, NSWindowCollectionBehavior, NSWindowOcclusionState,
+        NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectBlendingMode,
+        NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
+        NSWindowCollectionBehavior, NSWindowOcclusionState,
         NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
     },
     base::{id, nil},
@@ -3430,8 +3431,9 @@ extern "C" fn blurred_view_init_with_frame(this: &Object, _: Sel, frame: NSRect)
         let view = msg_send![super(this, class!(NSVisualEffectView)), initWithFrame: frame];
         // Use a colorless semantic material. The default value `AppearanceBased`, though not
         // manually set, is deprecated.
-        NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::Selection);
+        NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::HudWindow);
         NSVisualEffectView::setState_(view, NSVisualEffectState::Active);
+        NSVisualEffectView::setBlendingMode_(view, NSVisualEffectBlendingMode::BehindWindow);
         view
     }
 }
