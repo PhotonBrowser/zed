@@ -15,6 +15,9 @@ pub enum SurfaceSource {
     /// A macOS image buffer from CoreVideo
     #[cfg(target_os = "macos")]
     Surface(CVPixelBuffer),
+    /// A BGRA IOSurface frame with Metal producer synchronization.
+    #[cfg(target_os = "macos")]
+    ExternalImage(crate::MacExternalImageFrame),
     /// A GPU texture handle (type-erased to avoid depending on wgpu).
     ///
     /// Expected to be `Arc<wgpu::Texture>` created on the window's
@@ -35,6 +38,8 @@ impl Clone for SurfaceSource {
         match *self {
             #[cfg(target_os = "macos")]
             SurfaceSource::Surface(ref buf) => SurfaceSource::Surface(buf.clone()),
+            #[cfg(target_os = "macos")]
+            SurfaceSource::ExternalImage(ref frame) => SurfaceSource::ExternalImage(frame.clone()),
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             SurfaceSource::Texture { ref texture, size } => SurfaceSource::Texture {
                 texture: Arc::clone(texture),
@@ -49,6 +54,10 @@ impl std::fmt::Debug for SurfaceSource {
         match *self {
             #[cfg(target_os = "macos")]
             SurfaceSource::Surface(ref buf) => f.debug_tuple("Surface").field(buf).finish(),
+            #[cfg(target_os = "macos")]
+            SurfaceSource::ExternalImage(ref frame) => {
+                f.debug_tuple("ExternalImage").field(frame).finish()
+            }
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             SurfaceSource::Texture { size, .. } => f
                 .debug_struct("Texture")
@@ -62,6 +71,13 @@ impl std::fmt::Debug for SurfaceSource {
 impl From<CVPixelBuffer> for SurfaceSource {
     fn from(value: CVPixelBuffer) -> Self {
         SurfaceSource::Surface(value)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<crate::MacExternalImageFrame> for SurfaceSource {
+    fn from(value: crate::MacExternalImageFrame) -> Self {
+        SurfaceSource::ExternalImage(value)
     }
 }
 
@@ -152,6 +168,18 @@ impl Element for Surface {
                 // TODO: Add support for corner_radii
                 window.paint_surface(new_bounds, surface.clone());
             }
+            #[cfg(target_os = "macos")]
+            SurfaceSource::ExternalImage(frame) => {
+                let size = crate::size(
+                    frame.image_buffer.get_width().into(),
+                    frame.image_buffer.get_height().into(),
+                );
+                let new_bounds = self.object_fit.get_bounds(bounds, size);
+                let mut style = Style::default();
+                style.refine(&self.style);
+                let corner_radii = style.corner_radii.to_pixels(window.rem_size());
+                window.paint_external_surface(new_bounds, corner_radii, frame.clone());
+            }
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             SurfaceSource::Texture { texture, size } => {
                 let new_bounds = self.object_fit.get_bounds(bounds, *size);
@@ -233,13 +261,16 @@ mod tests {
                 _cx: &mut Context<Self>,
             ) -> impl IntoElement {
                 let texture = Arc::clone(&self.texture);
-                canvas(|_, _, _| (), move |bounds, _, window, _| {
-                    window.paint_surface(
-                        bounds,
-                        texture,
-                        size(DevicePixels(64), DevicePixels(64)),
-                    );
-                })
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        window.paint_surface(
+                            bounds,
+                            texture,
+                            size(DevicePixels(64), DevicePixels(64)),
+                        );
+                    },
+                )
                 .w(px(64.))
                 .h(px(64.))
             }
@@ -258,13 +289,11 @@ mod tests {
             cx.update_window(window, |_, window, _| {
                 let surfaces = window.painted_surfaces();
                 assert_eq!(surfaces.len(), 1);
-                assert!(
-                    surfaces[0]
-                        .texture
-                        .downcast_ref::<DummyTexture>()
-                        .is_some()
+                assert!(surfaces[0].texture.downcast_ref::<DummyTexture>().is_some());
+                assert_eq!(
+                    surfaces[0].texture_size,
+                    size(DevicePixels(64), DevicePixels(64))
                 );
-                assert_eq!(surfaces[0].texture_size, size(DevicePixels(64), DevicePixels(64)));
             })
             .unwrap();
         }

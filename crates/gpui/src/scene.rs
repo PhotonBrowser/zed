@@ -771,12 +771,250 @@ pub struct PaintSurface {
     pub content_mask: ContentMask<ScaledPixels>,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    /// Optional BGRA IOSurface frame with an explicit Metal producer fence.
+    #[cfg(target_os = "macos")]
+    pub external_image: Option<MacExternalImageFrame>,
+    /// macOS scene-level rounded clipping for the surface itself.
+    #[cfg(target_os = "macos")]
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Intersected parent rounded clips accumulated while painting this surface.
+    #[cfg(target_os = "macos")]
+    pub clip_stack: Vec<RoundedClip<ScaledPixels>>,
     /// Type-erased GPU texture (`Arc<wgpu::Texture>`). Ported from gpui-ce
     /// ([#39](https://github.com/gpui-ce/gpui-ce/commit/6d043b22e477)).
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub texture: std::sync::Arc<dyn std::any::Any + Send + Sync>,
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub texture_size: Size<crate::DevicePixels>,
+}
+
+/// A rounded rectangular clip in the GPUI scene coordinate space.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct RoundedClip<P: Clone + Debug + Default + PartialEq> {
+    /// Clip rectangle.
+    pub bounds: Bounds<P>,
+    /// Per-corner radii.
+    pub corner_radii: Corners<P>,
+}
+
+/// Persistent IOSurface backing metadata for a macOS GPU image.
+///
+/// The IOSurface send right is transported with the platform IPC attachment
+/// mechanism. Metal shared-event handles must travel through NSXPC and are not
+/// represented as serializable bytes here.
+#[cfg(target_os = "macos")]
+pub struct MacGpuBackingDescriptor {
+    /// Stable backing identity.
+    pub backing_id: u64,
+    /// Resize/format generation.
+    pub generation: u64,
+    /// Physical IOSurface width.
+    pub width: u32,
+    /// Physical IOSurface height.
+    pub height: u32,
+    /// CoreVideo/Metal pixel format code.
+    pub pixel_format: u32,
+    /// Owned IOSurface Mach send right, to be passed through IPC as an attachment.
+    pub iosurface_port: MacIOSurfaceSendRight,
+}
+
+/// An owned Mach send right for an IOSurface backing.
+#[cfg(target_os = "macos")]
+pub struct MacIOSurfaceSendRight(mach2::port::mach_port_t);
+
+#[cfg(target_os = "macos")]
+impl MacIOSurfaceSendRight {
+    /// Takes ownership of a send right returned by IOSurfaceCreateMachPort.
+    ///
+    /// # Safety
+    /// `port` must be a valid send right owned by the current task.
+    pub unsafe fn from_owned_raw(port: mach2::port::mach_port_t) -> Self {
+        assert_ne!(port, mach2::port::MACH_PORT_NULL);
+        Self(port)
+    }
+
+    /// Returns this task's local name for the send right. IPC must transfer the
+    /// right as an attachment; this number is not meaningful in another task.
+    pub fn as_raw(&self) -> mach2::port::mach_port_t {
+        self.0
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacIOSurfaceSendRight {
+    fn drop(&mut self) {
+        let result = unsafe {
+            mach2::mach_port::mach_port_deallocate(mach2::traps::mach_task_self(), self.0)
+        };
+        debug_assert_eq!(result, mach2::kern_return::KERN_SUCCESS);
+    }
+}
+
+/// Per-frame metadata for a persistent macOS GPU backing.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MacGpuFrame {
+    /// Persistent backing identity.
+    pub backing_id: u64,
+    /// Backing generation.
+    pub generation: u64,
+    /// Unique frame identity.
+    pub frame_id: u64,
+    /// Producer shared-event value signaled after rendering.
+    pub producer_signal_value: u64,
+}
+
+#[cfg(target_os = "macos")]
+/// An in-process imported frame. Cross-process producers send
+/// [`MacGpuBackingDescriptor`] once, then [`MacGpuFrame`] per rendered frame;
+/// the shared-event handle travels over a persistent NSXPC connection.
+#[derive(Clone)]
+pub struct MacExternalImageFrame {
+    /// Stable backing identity for import caching.
+    pub backing_id: u64,
+    /// Backing generation, incremented when dimensions/format change.
+    pub generation: u64,
+    /// Monotonic frame identity within a backing generation.
+    pub frame_id: u64,
+    /// In-process IOSurface reference identity; `image_buffer` owns its lifetime.
+    pub iosurface_identity: usize,
+    /// CoreVideo/Metal pixel format code (the current importer accepts BGRA8).
+    pub pixel_format: u32,
+    /// Shareable IOSurface-backed BGRA pixel buffer.
+    pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    /// Metal event signaled by the producer after its writes complete.
+    pub producer_event: metal::SharedEvent,
+    /// Required producer event value before sampling.
+    pub producer_value: u64,
+    /// Called after the GPUI sampling command buffer completes.
+    pub on_gpu_complete: std::sync::Arc<dyn Fn() + Send + Sync>,
+    lifecycle: std::sync::Arc<MacExternalImageLifecycle>,
+}
+
+#[cfg(target_os = "macos")]
+struct MacExternalImageLifecycle {
+    imported: std::sync::atomic::AtomicBool,
+    submitted: std::sync::atomic::AtomicBool,
+    outstanding_submissions: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacExternalImageLifecycle {
+    fn drop(&mut self) {
+        debug_assert_eq!(
+            self.outstanding_submissions
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "external image backing destroyed while submitted to GPUI"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Debug for MacExternalImageFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MacExternalImageFrame")
+            .field("backing_id", &self.backing_id)
+            .field("generation", &self.generation)
+            .field("frame_id", &self.frame_id)
+            .field("iosurface_identity", &self.iosurface_identity)
+            .field("pixel_format", &self.pixel_format)
+            .field("width", &self.image_buffer.get_width())
+            .field("height", &self.image_buffer.get_height())
+            .field("producer_value", &self.producer_value)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MacExternalImageFrame {
+    /// Creates a frame lease for an IOSurface backing.
+    pub fn new(
+        backing_id: u64,
+        generation: u64,
+        frame_id: u64,
+        iosurface_identity: usize,
+        pixel_format: u32,
+        image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+        producer_event: metal::SharedEvent,
+        producer_value: u64,
+        on_gpu_complete: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        assert_ne!(backing_id, 0, "external image backing ID must be nonzero");
+        assert_ne!(generation, 0, "external image generation must be nonzero");
+        assert_ne!(frame_id, 0, "external image frame ID must be nonzero");
+        assert_ne!(
+            iosurface_identity, 0,
+            "external image IOSurface must be valid"
+        );
+        Self {
+            backing_id,
+            generation,
+            frame_id,
+            iosurface_identity,
+            pixel_format,
+            image_buffer,
+            producer_event,
+            producer_value,
+            on_gpu_complete: std::sync::Arc::new(on_gpu_complete),
+            lifecycle: std::sync::Arc::new(MacExternalImageLifecycle {
+                imported: std::sync::atomic::AtomicBool::new(false),
+                submitted: std::sync::atomic::AtomicBool::new(false),
+                outstanding_submissions: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    /// Returns whether GPUI's sampling command buffer released this lease.
+    pub fn is_released(&self) -> bool {
+        self.lifecycle
+            .submitted
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self
+                .lifecycle
+                .outstanding_submissions
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+    }
+
+    #[doc(hidden)]
+    pub fn mark_imported(&self) {
+        self.lifecycle
+            .imported
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[doc(hidden)]
+    pub fn mark_submitted(&self) {
+        debug_assert!(
+            self.lifecycle
+                .imported
+                .load(std::sync::atomic::Ordering::Acquire),
+            "external image lease submitted before import"
+        );
+        self.lifecycle
+            .submitted
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.lifecycle
+            .outstanding_submissions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    #[doc(hidden)]
+    pub fn mark_gpu_complete(&self) {
+        let result = self.lifecycle.outstanding_submissions.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |outstanding| outstanding.checked_sub(1),
+        );
+        assert!(
+            result.is_ok(),
+            "external image completion after release or before submission"
+        );
+        (self.on_gpu_complete)();
+    }
 }
 
 impl std::fmt::Debug for PaintSurface {

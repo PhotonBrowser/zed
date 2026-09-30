@@ -11,18 +11,18 @@ use crate::{
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, KeyListener,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    LiveImage, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
-    transparent_black,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, LiveImage, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
+    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
+    point, prelude::*, px, rems, size, transparent_black,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -1184,6 +1184,8 @@ pub struct Window {
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+    #[cfg(target_os = "macos")]
+    pub(crate) rounded_clip_stack: Vec<crate::RoundedClip<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
@@ -1875,6 +1877,8 @@ impl Window {
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
+            #[cfg(target_os = "macos")]
+            rounded_clip_stack: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -3120,7 +3124,10 @@ impl Window {
         self.platform_window.draw(&self.rendered_frame.scene);
         let present_duration = present_started.elapsed();
         let timing = WindowFrameTiming {
-            draw: self.frame_draw_started.take().map_or(Duration::ZERO, |started| started.elapsed()),
+            draw: self
+                .frame_draw_started
+                .take()
+                .map_or(Duration::ZERO, |started| started.elapsed()),
             image_atlas: std::mem::take(&mut self.frame_image_atlas_time),
             present: present_duration,
             image_uploads: std::mem::take(&mut self.frame_image_uploads),
@@ -3711,6 +3718,36 @@ impl Window {
             result
         } else {
             f(self)
+        }
+    }
+
+    /// Applies a rounded clip to descendants while retaining the existing rectangular
+    /// content mask used for layout and hit testing.
+    pub fn with_rounded_content_mask<R>(
+        &mut self,
+        mask: Option<ContentMask<Pixels>>,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        #[cfg(target_os = "macos")]
+        {
+            if mask.is_none() {
+                return f(self);
+            }
+            self.with_content_mask(mask, |window| {
+                window.rounded_clip_stack.push(crate::RoundedClip {
+                    bounds,
+                    corner_radii: corner_radii.clamp_radii_for_quad_size(bounds.size),
+                });
+                let result = f(window);
+                window.rounded_clip_stack.pop();
+                result
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.with_content_mask(mask, f)
         }
     }
 
@@ -4669,7 +4706,10 @@ impl Window {
             return Ok(());
         }
         let visible_bounds = bounds.intersect(&bounds);
-        let params = RenderImageParams { image_id: image.id, frame_index: 0 };
+        let params = RenderImageParams {
+            image_id: image.id,
+            frame_index: 0,
+        };
         let key = params.into();
         let upload_started = Instant::now();
         let tile = image.with_pixels(|width, height, revision, bytes| {
@@ -4683,13 +4723,17 @@ impl Window {
                 anyhow::bail!("live image atlas did not provide an image tile");
             };
             let previous = self.live_image_versions.get(&image.id).copied();
-            let changed = previous.map_or(true, |(previous_revision, _)| previous_revision != revision);
+            let changed =
+                previous.map_or(true, |(previous_revision, _)| previous_revision != revision);
             let resized = previous.is_some_and(|(_, previous_size)| previous_size != image_size);
             let updated_tile = if inserted || !changed {
                 previous_tile
             } else {
-                self.sprite_atlas.update(&key, image_size, bytes)?
-                    .ok_or_else(|| anyhow!("live image atlas update did not provide an image tile"))?
+                self.sprite_atlas
+                    .update(&key, image_size, bytes)?
+                    .ok_or_else(|| {
+                        anyhow!("live image atlas update did not provide an image tile")
+                    })?
             };
             if inserted || changed {
                 self.frame_image_uploads += 1;
@@ -4697,13 +4741,16 @@ impl Window {
             if inserted || resized || updated_tile != previous_tile {
                 self.frame_image_recreations += 1;
             }
-            self.live_image_versions.insert(image.id, (revision, image_size));
+            self.live_image_versions
+                .insert(image.id, (revision, image_size));
             Ok::<_, anyhow::Error>(updated_tile)
         })?;
         self.frame_image_atlas_time += upload_started.elapsed();
 
         let visible_bounds = self.snap_bounds(visible_bounds);
-        let corner_radii = corner_radii.clamp_radii_for_quad_size(bounds.size).scale(self.scale_factor());
+        let corner_radii = corner_radii
+            .clamp_radii_for_quad_size(bounds.size)
+            .scale(self.scale_factor());
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
             nearest_neighbor: false.into(),
@@ -4719,7 +4766,13 @@ impl Window {
 
     /// Remove the atlas tile owned by a mutable image.
     pub fn drop_live_image(&mut self, image: &LiveImage) {
-        self.sprite_atlas.remove(&RenderImageParams { image_id: image.id, frame_index: 0 }.into());
+        self.sprite_atlas.remove(
+            &RenderImageParams {
+                image_id: image.id,
+                frame_index: 0,
+            }
+            .into(),
+        );
         self.live_image_versions.remove(&image.id);
     }
 
@@ -4861,6 +4914,50 @@ impl Window {
             bounds,
             content_mask,
             image_buffer,
+            external_image: None,
+            corner_radii: Corners::default(),
+            clip_stack: self
+                .rounded_clip_stack
+                .iter()
+                .map(|clip| crate::RoundedClip {
+                    bounds: clip.bounds.scale(self.scale_factor()),
+                    corner_radii: clip.corner_radii.scale(self.scale_factor()),
+                })
+                .collect(),
+        });
+    }
+
+    /// Paint an external IOSurface image. Producer synchronization and release
+    /// are attached to the exact scene submission that samples this frame.
+    #[cfg(target_os = "macos")]
+    pub fn paint_external_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        frame: crate::MacExternalImageFrame,
+    ) {
+        use crate::PaintSurface;
+
+        self.invalidator.debug_assert_paint();
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            image_buffer: frame.image_buffer.clone(),
+            external_image: Some(frame),
+            corner_radii: corner_radii
+                .scale(self.scale_factor())
+                .clamp_radii_for_quad_size(bounds.size),
+            clip_stack: self
+                .rounded_clip_stack
+                .iter()
+                .map(|clip| crate::RoundedClip {
+                    bounds: clip.bounds.scale(self.scale_factor()),
+                    corner_radii: clip.corner_radii.scale(self.scale_factor()),
+                })
+                .collect(),
         });
     }
 
@@ -4892,6 +4989,7 @@ impl Window {
             content_mask,
             texture,
             texture_size,
+            corner_radii: Corners::default(),
         });
     }
 

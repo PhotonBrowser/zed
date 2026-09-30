@@ -128,7 +128,9 @@ impl LiveImage {
     /// Create an empty BGRA surface. Pixel storage is allocated once and is
     /// resized only when the surface dimensions change.
     pub fn new(width: u32, height: u32) -> Option<Self> {
-        let length = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+        let length = (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?;
         Some(Self {
             id: next_image_id(),
             frame: std::sync::Mutex::new(LiveImageFrame {
@@ -142,10 +144,18 @@ impl LiveImage {
 
     /// Copy a strided BGRA frame into the existing backing allocation.
     pub fn update_bgra(&self, width: u32, height: u32, stride: usize, bytes: &[u8]) -> bool {
-        let Some(row_bytes) = (width as usize).checked_mul(4) else { return false };
-        let Some(source_length) = stride.checked_mul(height as usize) else { return false };
-        let Some(packed_length) = row_bytes.checked_mul(height as usize) else { return false };
-        if stride < row_bytes || bytes.len() < source_length { return false; }
+        let Some(row_bytes) = (width as usize).checked_mul(4) else {
+            return false;
+        };
+        let Some(source_length) = stride.checked_mul(height as usize) else {
+            return false;
+        };
+        let Some(packed_length) = row_bytes.checked_mul(height as usize) else {
+            return false;
+        };
+        if stride < row_bytes || bytes.len() < source_length {
+            return false;
+        }
         let mut frame = self.frame.lock().unwrap();
         if frame.width != width || frame.height != height || frame.pixels.len() != packed_length {
             frame.width = width;

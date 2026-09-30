@@ -6,3 +6,4 @@
 
 mod metal_atlas;
 pub mod metal_renderer;
+pub mod presentation_xpc;

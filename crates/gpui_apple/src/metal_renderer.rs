@@ -7,8 +7,8 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, Background, Bounds, ContentMask, Corners, DevicePixels, PaintSurface, Path,
+    Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -126,11 +126,15 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    bgra_surfaces_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
+    external_surface_textures:
+        std::collections::HashMap<(u64, u64), core_video::metal_texture::CVMetalTexture>,
+    external_surface_texture_imports: usize,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
@@ -149,6 +153,241 @@ pub struct PathRasterizationVertex {
 }
 
 impl MetalRenderer {
+    /// Builds the persistent, IPC-facing descriptor for an IOSurface backing.
+    /// The returned Mach send right is owned by the descriptor and must be
+    /// transferred as an attachment (never as its numeric port name).
+    pub fn describe_iosurface_backing(
+        image_buffer: &core_video::pixel_buffer::CVPixelBuffer,
+        backing_id: u64,
+        generation: u64,
+    ) -> Result<gpui::MacGpuBackingDescriptor> {
+        use core_video::pixel_buffer_io_surface::CVPixelBufferGetIOSurface;
+
+        anyhow::ensure!(
+            backing_id != 0 && generation != 0,
+            "invalid backing identity"
+        );
+        let iosurface = unsafe { CVPixelBufferGetIOSurface(image_buffer.as_concrete_TypeRef()) };
+        anyhow::ensure!(
+            !iosurface.is_null(),
+            "pixel buffer has no IOSurface backing"
+        );
+        let port = unsafe { io_surface::IOSurfaceCreateMachPort(iosurface) };
+        anyhow::ensure!(
+            port != mach2::port::MACH_PORT_NULL,
+            "IOSurfaceCreateMachPort failed"
+        );
+        let iosurface_port = unsafe { gpui::MacIOSurfaceSendRight::from_owned_raw(port) };
+        Ok(gpui::MacGpuBackingDescriptor {
+            backing_id,
+            generation,
+            width: image_buffer.get_width() as u32,
+            height: image_buffer.get_height() as u32,
+            pixel_format: image_buffer.get_pixel_format(),
+            iosurface_port,
+        })
+    }
+
+    /// Imports the backing using a received IOSurface Mach send right.
+    pub fn import_iosurface_backing(
+        descriptor: &gpui::MacGpuBackingDescriptor,
+    ) -> Result<core_video::pixel_buffer::CVPixelBuffer> {
+        anyhow::ensure!(
+            descriptor.backing_id != 0 && descriptor.generation != 0,
+            "invalid backing identity"
+        );
+        anyhow::ensure!(
+            descriptor.pixel_format == core_video::pixel_buffer::kCVPixelFormatType_32BGRA,
+            "unsupported IOSurface pixel format"
+        );
+        let raw_surface =
+            unsafe { io_surface::IOSurfaceLookupFromMachPort(descriptor.iosurface_port.as_raw()) };
+        anyhow::ensure!(!raw_surface.is_null(), "IOSurfaceLookupFromMachPort failed");
+        let iosurface = io_surface::IOSurface { obj: raw_surface };
+        anyhow::ensure!(
+            unsafe { io_surface::IOSurfaceGetWidth(raw_surface) } == descriptor.width as usize,
+            "IOSurface width differs from descriptor"
+        );
+        anyhow::ensure!(
+            unsafe { io_surface::IOSurfaceGetHeight(raw_surface) } == descriptor.height as usize,
+            "IOSurface height differs from descriptor"
+        );
+        let pixel_buffer = core_video::pixel_buffer::CVPixelBuffer::from_io_surface(
+            &iosurface, None,
+        )
+        .map_err(|status| anyhow::anyhow!("CVPixelBufferCreateWithIOSurface failed: {status}"))?;
+        Ok(pixel_buffer)
+    }
+
+    /// Creates a GPU-rendered IOSurface test frame using the same device
+    /// selection policy as the GPUI Metal renderer.
+    pub fn create_standalone_test_frame(
+        width: usize,
+        height: usize,
+        backing_id: u64,
+        generation: u64,
+        frame_id: u64,
+    ) -> anyhow::Result<gpui::MacExternalImageFrame> {
+        let (frame, command_buffer) = Self::create_standalone_test_frame_deferred(
+            width, height, backing_id, generation, frame_id,
+        )?;
+        command_buffer.commit();
+        Ok(frame)
+    }
+
+    /// Creates a GPU-rendered test frame but leaves its producer command
+    /// buffer uncommitted so cross-process tests can deliver the frame
+    /// descriptor before GPU completion.
+    pub fn create_standalone_test_frame_deferred(
+        width: usize,
+        height: usize,
+        backing_id: u64,
+        generation: u64,
+        frame_id: u64,
+    ) -> anyhow::Result<(gpui::MacExternalImageFrame, metal::CommandBuffer)> {
+        use core_foundation::{
+            base::{CFType, TCFType},
+            dictionary::CFDictionary,
+            string::CFString,
+        };
+        use core_video::pixel_buffer::{
+            CVPixelBuffer, kCVPixelBufferIOSurfacePropertiesKey, kCVPixelFormatType_32BGRA,
+        };
+        use core_video::pixel_buffer_io_surface::CVPixelBufferGetIOSurface;
+
+        let device = Self::create_device();
+        let empty_surface_properties: CFDictionary<CFString, CFType> =
+            CFDictionary::from_CFType_pairs(&[]);
+        let iosurface_key =
+            unsafe { CFString::wrap_under_get_rule(kCVPixelBufferIOSurfacePropertiesKey) };
+        let attributes: CFDictionary<CFString, CFType> = CFDictionary::from_CFType_pairs(&[(
+            iosurface_key,
+            empty_surface_properties.as_CFType(),
+        )]);
+        let image_buffer =
+            CVPixelBuffer::new(kCVPixelFormatType_32BGRA, width, height, Some(&attributes))
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to allocate BGRA IOSurface pixel buffer: {error}")
+                })?;
+        // CVPixelBufferGetIOSurface returns a borrowed reference. Do not wrap it
+        // using io-surface's create-rule wrapper: that would release CoreVideo's
+        // owned IOSurface reference when the temporary wrapper drops.
+        let iosurface = unsafe { CVPixelBufferGetIOSurface(image_buffer.as_concrete_TypeRef()) };
+        anyhow::ensure!(
+            !iosurface.is_null(),
+            "CoreVideo did not allocate an IOSurface"
+        );
+        let iosurface_identity = iosurface as usize;
+
+        let texture_cache = CVMetalTextureCache::new(None, device.clone(), None)
+            .map_err(|error| anyhow::anyhow!("failed to create producer texture cache: {error}"))?;
+        let cv_texture = texture_cache
+            .create_texture_from_image(
+                image_buffer.as_concrete_TypeRef(),
+                None,
+                MTLPixelFormat::BGRA8Unorm,
+                width,
+                height,
+                0,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!("failed to create Metal texture for IOSurface: {error}")
+            })?;
+        let raw_texture = unsafe { CVMetalTextureGetTexture(cv_texture.as_concrete_TypeRef()) };
+        anyhow::ensure!(
+            !raw_texture.is_null(),
+            "Metal failed to create producer IOSurface texture"
+        );
+        let texture = unsafe { metal::TextureRef::from_ptr(raw_texture as *mut _) };
+
+        let source = r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            struct Out { float4 position [[position]]; };
+            vertex Out v(uint id [[vertex_id]]) {
+                constexpr float2 p[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+                return { float4(p[id], 0.0, 1.0) };
+            }
+            fragment float4 f(Out in [[stage_in]],
+                              constant float2 *dimensions [[buffer(0)]],
+                              constant uint *marker_top_left [[buffer(1)]]) {
+                float2 p = in.position.xy;
+                bool marker = *marker_top_left
+                    ? (p.x < 36.0 && p.y < 36.0)
+                    : (p.x > dimensions->x - 36.0 && p.y > dimensions->y - 36.0);
+                if (marker) return float4(0.0, 0.0, 0.0, 1.0);
+                if (p.y < dimensions->y * 0.5)
+                    return p.x < dimensions->x * 0.5 ? float4(1, 0, 0, 1) : float4(0, 1, 0, 1);
+                return p.x < dimensions->x * 0.5 ? float4(0, 0, 1, 1) : float4(1, 1, 1, 1);
+            }
+        "#;
+        let library = device
+            .new_library_with_source(source, &metal::CompileOptions::new())
+            .map_err(|error| anyhow::anyhow!("failed to compile IOSurface test shader: {error}"))?;
+        let pipeline_descriptor = metal::RenderPipelineDescriptor::new();
+        let vertex_function = library.get_function("v", None).map_err(|error| {
+            anyhow::anyhow!("missing IOSurface producer vertex shader: {error}")
+        })?;
+        let fragment_function = library.get_function("f", None).map_err(|error| {
+            anyhow::anyhow!("missing IOSurface producer fragment shader: {error}")
+        })?;
+        pipeline_descriptor.set_vertex_function(Some(vertex_function.as_ref()));
+        pipeline_descriptor.set_fragment_function(Some(fragment_function.as_ref()));
+        pipeline_descriptor
+            .color_attachments()
+            .object_at(0)
+            .unwrap()
+            .set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        let pipeline = device
+            .new_render_pipeline_state(&pipeline_descriptor)
+            .map_err(|error| {
+                anyhow::anyhow!("failed to create IOSurface producer pipeline: {error}")
+            })?;
+
+        let event = device.new_shared_event();
+        let queue = device.new_command_queue();
+        let command_buffer = queue.new_command_buffer().to_owned();
+        let render_pass = metal::RenderPassDescriptor::new();
+        let color_attachment = render_pass.color_attachments().object_at(0).unwrap();
+        color_attachment.set_texture(Some(texture));
+        color_attachment.set_load_action(metal::MTLLoadAction::DontCare);
+        color_attachment.set_store_action(metal::MTLStoreAction::Store);
+        let encoder = command_buffer.new_render_command_encoder(render_pass);
+        encoder.set_render_pipeline_state(&pipeline);
+        let dimensions = [width as f32, height as f32];
+        let marker_top_left: u32 = u32::from(frame_id == 1);
+        encoder.set_fragment_bytes(
+            0,
+            mem::size_of_val(&dimensions) as u64,
+            dimensions.as_ptr().cast(),
+        );
+        encoder.set_fragment_bytes(
+            1,
+            mem::size_of_val(&marker_top_left) as u64,
+            &marker_top_left as *const _ as *const c_void,
+        );
+        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+        encoder.end_encoding();
+        command_buffer.encode_signal_event(&event, 1);
+
+        let completion_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let completed = completion_count.clone();
+        let frame = gpui::MacExternalImageFrame::new(
+            backing_id,
+            generation,
+            frame_id,
+            iosurface_identity,
+            kCVPixelFormatType_32BGRA,
+            image_buffer,
+            event,
+            1,
+            move || {
+                completed.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            },
+        );
+        Ok((frame, command_buffer))
+    }
+
     /// Creates a new MetalRenderer with a CAMetalLayer for window-based rendering.
     pub fn new(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>, transparent: bool) -> Self {
         let device = Self::create_device();
@@ -208,12 +447,28 @@ impl MetalRenderer {
         }
     }
 
+    /// Returns the identity of the Metal device selected by GPUI's renderer.
+    /// The registry ID is stable across processes and can be compared with a
+    /// producer device to verify that both target the same physical GPU.
+    pub fn device_identity() -> MetalDeviceIdentity {
+        let device = Self::create_device();
+        MetalDeviceIdentity {
+            name: device.name().to_string(),
+            registry_id: device.registry_id(),
+        }
+    }
+
     fn new_internal(
         device: metal::Device,
         layer: Option<metal::MetalLayer>,
         opaque: bool,
         instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     ) -> Self {
+        log::info!(
+            "GPUI Metal device: {} (registryID={})",
+            device.name(),
+            device.registry_id()
+        );
         #[cfg(feature = "runtime_shaders")]
         let library = device
             .new_library_with_source(&SHADERS_SOURCE_FILE, &metal::CompileOptions::new())
@@ -323,6 +578,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let bgra_surfaces_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "surfaces",
+            "surface_vertex",
+            "bgra_surface_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -345,10 +608,13 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            bgra_surfaces_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
+            external_surface_textures: std::collections::HashMap::new(),
+            external_surface_texture_imports: 0,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -520,9 +786,23 @@ impl MetalRenderer {
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
+        for surface in &scene.surfaces {
+            if let Some(frame) = &surface.external_image {
+                frame.mark_submitted();
+            }
+        }
+        let completion_frames = scene
+            .surfaces
+            .iter()
+            .filter_map(|surface| surface.external_image.as_ref())
+            .cloned()
+            .collect::<Vec<_>>();
         let block = ConcreteBlock::new(move |_| {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
+            }
+            for frame in &completion_frames {
+                frame.mark_gpu_complete();
             }
         });
         let block = block.copy();
@@ -571,6 +851,20 @@ impl MetalRenderer {
         scene: &Scene,
         size: Size<DevicePixels>,
     ) -> Result<RgbaImage> {
+        self.render_scene_to_image_with_submission_callback(scene, size, || {})
+    }
+
+    /// Renders a scene and invokes a callback immediately after the exact
+    /// scene command buffer is committed, before waiting for GPU completion.
+    /// This is useful for integration tests that need to release a producer
+    /// only after the consumer's GPU wait has been submitted.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn render_scene_to_image_with_submission_callback(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+        on_submitted: impl FnOnce(),
+    ) -> Result<RgbaImage> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             anyhow::bail!("Invalid size for render_scene_to_image: {:?}", size);
         }
@@ -601,6 +895,7 @@ impl MetalRenderer {
 
         // Commit and wait for completion
         command_buffer.commit();
+        on_submitted();
         command_buffer.wait_until_completed();
 
         read_texture_to_image(&target_texture)
@@ -658,6 +953,13 @@ impl MetalRenderer {
     ) -> Result<metal::CommandBuffer> {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
+        // These waits are encoded on the same command buffer as the draws that
+        // sample the external textures, before any render encoder is created.
+        for surface in &scene.surfaces {
+            if let Some(frame) = &surface.external_image {
+                command_buffer.encode_wait_for_event(&frame.producer_event, frame.producer_value);
+            }
+        }
         let alpha = if self.opaque { 1. } else { 0. };
 
         let mut command_encoder = new_command_encoder_for_texture(
@@ -1130,7 +1432,6 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1140,6 +1441,11 @@ impl MetalRenderer {
             SurfaceInputIndex::Surfaces as u64,
             Some(&instance_bindings.surfaces.buffer),
             instance_bindings.surfaces.offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            SurfaceInputIndex::Clips as u64,
+            Some(&instance_bindings.surface_clips.buffer),
+            instance_bindings.surface_clips.offset as u64,
         );
         command_encoder.set_vertex_bytes(
             SurfaceInputIndex::ViewportSize as u64,
@@ -1153,6 +1459,69 @@ impl MetalRenderer {
                 DevicePixels::from(surface.image_buffer.get_height() as i32),
             );
 
+            if let Some(frame) = &surface.external_image {
+                assert_eq!(
+                    frame.image_buffer.get_width() as u64,
+                    texture_size.width.0 as u64
+                );
+                assert_eq!(
+                    frame.image_buffer.get_height() as u64,
+                    texture_size.height.0 as u64
+                );
+                command_encoder.set_render_pipeline_state(&self.bgra_surfaces_pipeline_state);
+                let key = (frame.backing_id, frame.generation);
+                if !self.external_surface_textures.contains_key(&key) {
+                    let import_started = std::time::Instant::now();
+                    let imported = self
+                        .core_video_texture_cache
+                        .create_texture_from_image(
+                            frame.image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::BGRA8Unorm,
+                            frame.image_buffer.get_width(),
+                            frame.image_buffer.get_height(),
+                            0,
+                        )
+                        .expect("failed to import BGRA IOSurface into Metal");
+                    self.external_surface_textures.insert(key, imported);
+                    self.external_surface_texture_imports += 1;
+                    log::info!(
+                        "GPUI imported IOSurface backing={} generation={} ({}x{}, BGRA8) in {:.3}ms",
+                        frame.backing_id,
+                        frame.generation,
+                        texture_size.width.0,
+                        texture_size.height.0,
+                        import_started.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                frame.mark_imported();
+                let imported = self.external_surface_textures.get(&key).unwrap();
+                let raw_texture =
+                    unsafe { CVMetalTextureGetTexture(imported.as_concrete_TypeRef()) };
+                assert!(
+                    !raw_texture.is_null(),
+                    "BGRA IOSurface import returned null texture"
+                );
+                command_encoder.set_fragment_texture(
+                    SurfaceInputIndex::BgraTexture as u64,
+                    Some(unsafe { metal::TextureRef::from_ptr(raw_texture as *mut _) }),
+                );
+                command_encoder.set_vertex_bytes(
+                    SurfaceInputIndex::TextureSize as u64,
+                    mem::size_of_val(&texture_size) as u64,
+                    &texture_size as *const Size<DevicePixels> as *const _,
+                );
+                command_encoder.draw_primitives_instanced_base_instance(
+                    metal::MTLPrimitiveType::Triangle,
+                    0,
+                    6,
+                    1,
+                    (first_surface + index) as u64,
+                );
+                continue;
+            }
+
+            command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
             assert_eq!(
                 surface.image_buffer.get_pixel_format(),
                 kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
@@ -1205,6 +1574,15 @@ impl MetalRenderer {
             );
         }
     }
+}
+
+/// Identifies the Metal device selected by GPUI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetalDeviceIdentity {
+    /// Human-readable Metal device name.
+    pub name: String,
+    /// Metal registry ID, suitable for comparing devices across processes.
+    pub registry_id: u64,
 }
 
 fn new_command_encoder_for_texture<'a>(
@@ -1389,19 +1767,37 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
     surfaces: InstanceBinding,
+    surface_clips: InstanceBinding,
 }
 
 fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
+    let mut surface_clips = Vec::new();
+    let surfaces = scene
+        .surfaces
+        .iter()
+        .map(|surface| {
+            let clip_offset = surface_clips.len() as u32;
+            surface_clips.extend(surface.clip_stack.iter().copied().map(|clip| SurfaceClip {
+                bounds: clip.bounds,
+                corner_radii: clip.corner_radii,
+            }));
+            SurfaceBounds {
+                bounds: surface.bounds,
+                content_mask: surface.content_mask,
+                corner_radii: surface.corner_radii,
+                clip_offset,
+                clip_count: surface.clip_stack.len() as u32,
+            }
+        })
+        .collect::<Vec<_>>();
     Ok(InstanceBindings {
         quads: writer.write(&scene.quads)?,
         shadows: writer.write(&scene.shadows)?,
         underlines: writer.write(&scene.underlines)?,
         monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
         polychrome_sprites: writer.write(&scene.polychrome_sprites)?,
-        surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
-            bounds: surface.bounds,
-            content_mask: surface.content_mask,
-        }))?,
+        surfaces: writer.write_iter(surfaces.into_iter())?,
+        surface_clips: writer.write_iter(surface_clips.into_iter())?,
     })
 }
 
@@ -1574,6 +1970,8 @@ enum SurfaceInputIndex {
     TextureSize = 3,
     YTexture = 4,
     CbCrTexture = 5,
+    BgraTexture = 6,
+    Clips = 7,
 }
 
 #[repr(C)]
@@ -1593,11 +1991,190 @@ pub struct PathSprite {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    pub clip_offset: u32,
+    pub clip_count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SurfaceClip {
+    pub bounds: Bounds<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub struct MetalHeadlessRenderer {
     renderer: MetalRenderer,
+}
+
+/// Standalone GPU producer used by the cross-process presentation stress
+/// example. It retains one Metal texture per IOSurface backing and rewrites
+/// that same texture only after the matching GPUI lease is released.
+#[cfg(all(target_os = "macos", feature = "test-support"))]
+pub struct StandaloneMetalPatternProducer {
+    command_queue: CommandQueue,
+    pipeline: metal::RenderPipelineState,
+    texture_cache: CVMetalTextureCache,
+    textures: std::collections::HashMap<(u64, u64), metal::Texture>,
+    texture_imports: usize,
+    event: metal::SharedEvent,
+}
+
+#[cfg(all(target_os = "macos", feature = "test-support"))]
+impl StandaloneMetalPatternProducer {
+    pub fn new(event: metal::SharedEvent) -> anyhow::Result<Self> {
+        let device = MetalRenderer::create_device();
+        let source = r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            struct Out { float4 position [[position]]; };
+            vertex Out v(uint id [[vertex_id]]) {
+                constexpr float2 p[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+                return { float4(p[id], 0.0, 1.0) };
+            }
+            fragment float4 f(Out in [[stage_in]],
+                              constant float2 *dimensions [[buffer(0)]],
+                              constant uint *marker_top_left [[buffer(1)]]) {
+                float2 p = in.position.xy;
+                bool marker = *marker_top_left
+                    ? (p.x < 36.0 && p.y < 36.0)
+                    : (p.x > dimensions->x - 36.0 && p.y > dimensions->y - 36.0);
+                if (marker) return float4(0.0, 0.0, 0.0, 1.0);
+                if (p.y < dimensions->y * 0.5)
+                    return p.x < dimensions->x * 0.5 ? float4(1, 0, 0, 1) : float4(0, 1, 0, 1);
+                return p.x < dimensions->x * 0.5 ? float4(0, 0, 1, 1) : float4(1, 1, 1, 1);
+            }
+        "#;
+        let library = device
+            .new_library_with_source(source, &metal::CompileOptions::new())
+            .map_err(|error| {
+                anyhow::anyhow!("could not compile persistent producer shader: {error}")
+            })?;
+        let descriptor = metal::RenderPipelineDescriptor::new();
+        let vertex = library
+            .get_function("v", None)
+            .map_err(|error| anyhow::anyhow!("missing producer vertex function: {error}"))?;
+        let fragment = library
+            .get_function("f", None)
+            .map_err(|error| anyhow::anyhow!("missing producer fragment function: {error}"))?;
+        descriptor.set_vertex_function(Some(vertex.as_ref()));
+        descriptor.set_fragment_function(Some(fragment.as_ref()));
+        descriptor
+            .color_attachments()
+            .object_at(0)
+            .unwrap()
+            .set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        let pipeline = device
+            .new_render_pipeline_state(&descriptor)
+            .map_err(|error| anyhow::anyhow!("could not create producer pipeline: {error}"))?;
+        let texture_cache = CVMetalTextureCache::new(None, device.clone(), None)
+            .map_err(|error| anyhow::anyhow!("could not create producer texture cache: {error}"))?;
+        Ok(Self {
+            command_queue: device.new_command_queue(),
+            pipeline,
+            texture_cache,
+            textures: std::collections::HashMap::new(),
+            texture_imports: 0,
+            event,
+        })
+    }
+
+    /// Imports each producer texture once for this generation/backing set.
+    pub fn register_backings(
+        &mut self,
+        frames: &[&gpui::MacExternalImageFrame],
+    ) -> anyhow::Result<usize> {
+        for frame in frames {
+            let key = (frame.backing_id, frame.generation);
+            if self.textures.contains_key(&key) {
+                continue;
+            }
+            let cv_texture = self
+                .texture_cache
+                .create_texture_from_image(
+                    frame.image_buffer.as_concrete_TypeRef(),
+                    None,
+                    MTLPixelFormat::BGRA8Unorm,
+                    frame.image_buffer.get_width(),
+                    frame.image_buffer.get_height(),
+                    0,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("could not import producer IOSurface texture: {error}")
+                })?;
+            let raw_texture = unsafe { CVMetalTextureGetTexture(cv_texture.as_concrete_TypeRef()) };
+            anyhow::ensure!(
+                !raw_texture.is_null(),
+                "producer IOSurface texture import was null"
+            );
+            let retained_texture = unsafe { msg_send![raw_texture, retain] };
+            let texture = unsafe { metal::Texture::from_ptr(retained_texture) };
+            self.textures.insert(key, texture);
+            self.texture_imports += 1;
+        }
+        Ok(self.textures.len())
+    }
+
+    pub fn encode_frame(
+        &self,
+        frame: &gpui::MacExternalImageFrame,
+        frame_id: u64,
+        signal_value: u64,
+    ) -> anyhow::Result<metal::CommandBuffer> {
+        let key = (frame.backing_id, frame.generation);
+        let texture = self
+            .textures
+            .get(&key)
+            .context("producer does not have this backing imported")?;
+        let width = frame.image_buffer.get_width();
+        let height = frame.image_buffer.get_height();
+        let command_buffer = self.command_queue.new_command_buffer().to_owned();
+        let render_pass = metal::RenderPassDescriptor::new();
+        let attachment = render_pass.color_attachments().object_at(0).unwrap();
+        attachment.set_texture(Some(texture));
+        attachment.set_load_action(metal::MTLLoadAction::DontCare);
+        attachment.set_store_action(metal::MTLStoreAction::Store);
+        let encoder = command_buffer.new_render_command_encoder(render_pass);
+        encoder.set_render_pipeline_state(&self.pipeline);
+        let dimensions = [width as f32, height as f32];
+        // Alternate the asymmetry every frame so the consumer can verify
+        // producer reuse actually rewrites each IOSurface after its release.
+        let marker_top_left = u32::from(frame_id % 2 == 1);
+        encoder.set_fragment_bytes(
+            0,
+            mem::size_of_val(&dimensions) as u64,
+            dimensions.as_ptr().cast(),
+        );
+        encoder.set_fragment_bytes(
+            1,
+            mem::size_of_val(&marker_top_left) as u64,
+            &marker_top_left as *const _ as *const c_void,
+        );
+        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+        encoder.end_encoding();
+        command_buffer.encode_signal_event(&self.event, signal_value);
+        Ok(command_buffer)
+    }
+
+    pub fn retire_generation(&mut self, generation: u64) -> usize {
+        let before = self.textures.len();
+        self.textures
+            .retain(|(_, cached_generation), _| *cached_generation != generation);
+        before - self.textures.len()
+    }
+
+    pub fn texture_count(&self) -> usize {
+        self.textures.len()
+    }
+
+    pub fn texture_import_count(&self) -> usize {
+        self.texture_imports
+    }
+
+    pub fn signaled_value(&self) -> u64 {
+        self.event.signaled_value()
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1606,6 +2183,39 @@ impl MetalHeadlessRenderer {
         let instance_buffer_pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
         let renderer = MetalRenderer::new_headless(instance_buffer_pool);
         Self { renderer }
+    }
+
+    /// Number of persistent IOSurface textures imported by this renderer.
+    /// Exposed only to make the standalone transport stress test verify that
+    /// imports stay bounded by backing count.
+    pub fn external_surface_texture_count(&self) -> usize {
+        self.renderer.external_surface_textures.len()
+    }
+
+    /// Lifetime count of distinct backing texture imports, including retired
+    /// generations, for standalone resource accounting.
+    pub fn external_surface_texture_import_count(&self) -> usize {
+        self.renderer.external_surface_texture_imports
+    }
+
+    /// Drops the import cache for a generation after its final frame lease has
+    /// completed and no scene can reference it again.
+    pub fn retire_external_image_generation(&mut self, generation: u64) -> usize {
+        let before = self.renderer.external_surface_textures.len();
+        self.renderer
+            .external_surface_textures
+            .retain(|(_, cached_generation), _| *cached_generation != generation);
+        before - self.renderer.external_surface_textures.len()
+    }
+
+    pub fn render_scene_to_image_with_submission_callback(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+        on_submitted: impl FnOnce(),
+    ) -> anyhow::Result<RgbaImage> {
+        self.renderer
+            .render_scene_to_image_with_submission_callback(scene, size, on_submitted)
     }
 }
 
@@ -1625,5 +2235,244 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod external_image_tests {
+    use super::*;
+    use gpui::{
+        ContentMask, PaintSurface, PlatformHeadlessRenderer, RoundedClip, ScaledPixels, bounds,
+        point, size,
+    };
+
+    fn insert_external_frame(scene: &mut Scene, frame: gpui::MacExternalImageFrame) {
+        let width = frame.image_buffer.get_width() as f32;
+        let height = frame.image_buffer.get_height() as f32;
+        let bounds = bounds(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(width), ScaledPixels(height)),
+        );
+        scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            image_buffer: frame.image_buffer.clone(),
+            external_image: Some(frame),
+            corner_radii: Corners::default(),
+            clip_stack: Vec::new(),
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            texture: unreachable!(),
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            texture_size: size(DevicePixels(width as i32), DevicePixels(height as i32)),
+        });
+    }
+
+    #[test]
+    fn gpu_rendered_bgra_iosurface_is_sampled_by_gpui_scene() {
+        let frame = MetalRenderer::create_standalone_test_frame(800, 500, 1, 1, 1).unwrap();
+        let lease = frame.clone();
+        let mut scene = Scene::default();
+        insert_external_frame(&mut scene, frame.clone());
+        scene.finish();
+
+        let mut renderer = MetalHeadlessRenderer::new();
+        let image = renderer
+            .render_scene_to_image(&scene, size(DevicePixels(800), DevicePixels(500)))
+            .unwrap();
+        assert_eq!(image.get_pixel(100, 100).0, [255, 0, 0, 255]);
+        assert_eq!(image.get_pixel(700, 100).0, [0, 255, 0, 255]);
+        assert_eq!(image.get_pixel(100, 400).0, [0, 0, 255, 255]);
+        assert_eq!(image.get_pixel(700, 400).0, [255, 255, 255, 255]);
+        assert_eq!(image.get_pixel(10, 10).0, [0, 0, 0, 255]);
+        assert!(
+            lease.is_released(),
+            "GPUI GPU completion did not release the lease"
+        );
+        let screenshot = std::env::temp_dir().join("gpui-bgra-iosurface.png");
+        image.save(&screenshot).unwrap();
+        eprintln!("GPUI IOSurface scene capture: {}", screenshot.display());
+    }
+
+    #[test]
+    fn iosurface_mach_send_right_imports_same_backing() {
+        let frame = MetalRenderer::create_standalone_test_frame(320, 200, 21, 1, 1).unwrap();
+        let source_surface = unsafe {
+            core_video::pixel_buffer_io_surface::CVPixelBufferGetIOSurface(
+                frame.image_buffer.as_concrete_TypeRef(),
+            )
+        };
+        let source_surface_id = unsafe { io_surface::IOSurfaceGetID(source_surface) };
+        let producer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        let descriptor = MetalRenderer::describe_iosurface_backing(
+            &frame.image_buffer,
+            frame.backing_id,
+            frame.generation,
+        )
+        .unwrap();
+        let imported_buffer = MetalRenderer::import_iosurface_backing(&descriptor).unwrap();
+        let imported_surface = unsafe {
+            core_video::pixel_buffer_io_surface::CVPixelBufferGetIOSurface(
+                imported_buffer.as_concrete_TypeRef(),
+            )
+        };
+        assert_eq!(
+            unsafe { io_surface::IOSurfaceGetID(imported_surface) },
+            source_surface_id
+        );
+        assert_eq!(imported_buffer.get_width(), frame.image_buffer.get_width());
+        assert_eq!(
+            imported_buffer.get_height(),
+            frame.image_buffer.get_height()
+        );
+    }
+
+    #[test]
+    fn gpu_rendered_bgra_iosurface_uses_gpui_rounded_scene_clip() {
+        let frame = MetalRenderer::create_standalone_test_frame(800, 500, 10, 1, 1).unwrap();
+        let mut scene = Scene::default();
+        insert_external_frame(&mut scene, frame);
+        scene.surfaces[0].corner_radii = Corners {
+            top_left: ScaledPixels(40.),
+            top_right: ScaledPixels(40.),
+            bottom_right: ScaledPixels(40.),
+            bottom_left: ScaledPixels(40.),
+        };
+        scene.finish();
+        let mut renderer = MetalHeadlessRenderer::new();
+        let image = renderer
+            .render_scene_to_image(&scene, size(DevicePixels(800), DevicePixels(500)))
+            .unwrap();
+        image.save("/tmp/gpui-bgra-iosurface-rounded.png").unwrap();
+        assert_ne!(
+            image.get_pixel(0, 499).0,
+            [0, 0, 255, 255],
+            "rounded corner retained the blue surface pixel"
+        );
+        assert_eq!(
+            image.get_pixel(40, 40).0,
+            [255, 0, 0, 255],
+            "surface interior was clipped"
+        );
+    }
+
+    #[test]
+    fn nested_rounded_clips_intersect_for_offset_children() {
+        let frame = MetalRenderer::create_standalone_test_frame(800, 500, 11, 1, 2).unwrap();
+        let mut renderer = MetalHeadlessRenderer::new();
+        for (child_x, child_y) in [(-12., -12.), (18., 8.), (42., 30.)] {
+            let mut scene = Scene::default();
+            insert_external_frame(&mut scene, frame.clone());
+            scene.surfaces[0].clip_stack = vec![
+                RoundedClip {
+                    bounds: bounds(
+                        point(ScaledPixels(0.), ScaledPixels(0.)),
+                        size(ScaledPixels(800.), ScaledPixels(500.)),
+                    ),
+                    corner_radii: Corners {
+                        top_left: ScaledPixels(48.),
+                        top_right: ScaledPixels(48.),
+                        bottom_right: ScaledPixels(48.),
+                        bottom_left: ScaledPixels(48.),
+                    },
+                },
+                RoundedClip {
+                    bounds: bounds(
+                        point(ScaledPixels(child_x), ScaledPixels(child_y)),
+                        size(ScaledPixels(740.), ScaledPixels(460.)),
+                    ),
+                    corner_radii: Corners {
+                        top_left: ScaledPixels(24.),
+                        top_right: ScaledPixels(24.),
+                        bottom_right: ScaledPixels(24.),
+                        bottom_left: ScaledPixels(24.),
+                    },
+                },
+            ];
+            scene.finish();
+            let image = renderer
+                .render_scene_to_image(&scene, size(DevicePixels(800), DevicePixels(500)))
+                .unwrap();
+            assert_ne!(
+                image.get_pixel(1, 1).0,
+                [255, 0, 0, 255],
+                "outer rounded corner leaked at offset ({child_x}, {child_y})"
+            );
+            assert_eq!(
+                image.get_pixel(60, 60).0,
+                [255, 0, 0, 255],
+                "interior incorrectly clipped at offset ({child_x}, {child_y})"
+            );
+            if child_x < 0.0 {
+                assert_ne!(
+                    image.get_pixel(1, 30).0,
+                    [255, 0, 0, 255],
+                    "inner clip hid the outer-corner leak"
+                );
+                image.save("/tmp/gpui-bgra-iosurface-nested.png").unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn external_image_resize_generations_wait_and_release() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let mut scene = Scene::default();
+        let mut retained_old_backings = Vec::new();
+        for (index, (width, height)) in
+            [(800, 500), (1000, 700), (640, 480), (1280, 720), (800, 500)]
+                .into_iter()
+                .enumerate()
+        {
+            let width = width as usize;
+            let height = height as usize;
+            let frame_id = index as u64 + 1;
+            let generation = frame_id;
+            let frame = MetalRenderer::create_standalone_test_frame(
+                width, height, frame_id, generation, frame_id,
+            )
+            .unwrap();
+            let lease = frame.clone();
+            retained_old_backings.push(frame.image_buffer.clone());
+            scene.clear();
+            insert_external_frame(&mut scene, frame);
+            scene.finish();
+            let image = renderer
+                .render_scene_to_image(
+                    &scene,
+                    size(DevicePixels(width as i32), DevicePixels(height as i32)),
+                )
+                .unwrap();
+            assert_eq!(image.get_pixel(100, 100).0, [255, 0, 0, 255]);
+            assert_eq!(
+                image.get_pixel((width - 100) as u32, 100).0,
+                [0, 255, 0, 255]
+            );
+            assert_eq!(
+                image.get_pixel(100, (height - 100) as u32).0,
+                [0, 0, 255, 255]
+            );
+            assert_eq!(
+                image
+                    .get_pixel((width - 100) as u32, (height - 100) as u32)
+                    .0,
+                [255, 255, 255, 255]
+            );
+            let marker = if frame_id == 1 {
+                image.get_pixel(10, 10)
+            } else {
+                image.get_pixel((width - 10) as u32, (height - 10) as u32)
+            };
+            assert_eq!(marker.0, [0, 0, 0, 255]);
+            assert!(
+                lease.is_released(),
+                "generation {generation} did not release after GPU completion"
+            );
+            let screenshot =
+                std::env::temp_dir().join(format!("gpui-iosurface-generation-{generation}.png"));
+            image.save(screenshot).unwrap();
+        }
+        drop(retained_old_backings);
     }
 }

@@ -779,7 +779,11 @@ impl Style {
             let grow = outline.offset + outline.width;
             let outer = bounds.dilate(grow);
             let grow_corner = |radius: Pixels| {
-                if radius > px(0.) { (radius + grow).max(px(0.)) } else { px(0.) }
+                if radius > px(0.) {
+                    (radius + grow).max(px(0.))
+                } else {
+                    px(0.)
+                }
             };
             let radii = Corners {
                 top_left: grow_corner(corner_radii.top_left),

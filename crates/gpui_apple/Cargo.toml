@@ -30,6 +30,8 @@ derive_more.workspace = true
 etagere.workspace = true
 foreign-types.workspace = true
 image.workspace = true
+io-surface = "0.16.1"
+mach2.workspace = true
 log.workspace = true
 metal.workspace = true
 objc.workspace = true
@@ -37,7 +39,9 @@ parking_lot.workspace = true
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
 cbindgen.workspace = true
+cc = "1.4"
 gpui.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+gpui_platform = { workspace = true, features = ["font-kit"] }

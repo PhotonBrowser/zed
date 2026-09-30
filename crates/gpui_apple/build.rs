@@ -15,12 +15,25 @@ mod macos_build {
     use cbindgen::Config;
 
     pub fn run() {
+        compile_presentation_xpc_bridge();
         let header_path = generate_shader_bindings();
 
         #[cfg(feature = "runtime_shaders")]
         emit_stitched_shaders(&header_path);
         #[cfg(not(feature = "runtime_shaders"))]
         compile_metal_shaders(&header_path);
+    }
+
+    fn compile_presentation_xpc_bridge() {
+        let source = "src/presentation_xpc.m";
+        println!("cargo:rerun-if-changed={source}");
+        cc::Build::new()
+            .file(source)
+            .flag("-fobjc-arc")
+            .flag("-fblocks")
+            .compile("photon_presentation_xpc");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=Metal");
     }
 
     fn generate_shader_bindings() -> PathBuf {
@@ -61,6 +74,7 @@ mod macos_build {
             "PathSprite".into(),
             "SurfaceInputIndex".into(),
             "SurfaceBounds".into(),
+            "SurfaceClip".into(),
             "TransformationMatrix".into(),
         ]);
         config.no_includes = true;

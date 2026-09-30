@@ -2313,7 +2313,9 @@ mod tests {
     // https://github.com/gpui-ce/gpui-ce/commit/6d043b22e477
     #[test]
     fn surface_shader_samples_a_single_rgba_texture() {
-        assert!(STORAGE_BUFFER_SHADERS.contains("@group(1) @binding(1) var t_surface: texture_2d<f32>"));
+        assert!(
+            STORAGE_BUFFER_SHADERS.contains("@group(1) @binding(1) var t_surface: texture_2d<f32>")
+        );
         assert!(!STORAGE_BUFFER_SHADERS.contains("var t_y: texture_2d<f32>"));
         assert!(!STORAGE_BUFFER_SHADERS.contains("var t_cb_cr: texture_2d<f32>"));
         assert!(WEBGL_SHADERS.contains("@group(1) @binding(1) var t_surface: texture_2d<f32>"));

@@ -853,12 +853,20 @@ fragment float4 path_sprite_fragment(
 struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;
+  float4 surface_rect [[flat]];
+  float4 corner_radii [[flat]];
+  uint clip_offset [[flat]];
+  uint clip_count [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
 struct SurfaceFragmentInput {
   float4 position [[position]];
   float2 texture_position;
+  float4 surface_rect [[flat]];
+  float4 corner_radii [[flat]];
+  uint clip_offset [[flat]];
+  uint clip_count [[flat]];
 };
 
 vertex SurfaceVertexOutput surface_vertex(
@@ -881,14 +889,49 @@ vertex SurfaceVertexOutput surface_vertex(
   return SurfaceVertexOutput{
       device_position,
       texture_position,
+      float4(surface.bounds.origin.x, surface.bounds.origin.y,
+             surface.bounds.size.width, surface.bounds.size.height),
+      float4(surface.corner_radii.top_left, surface.corner_radii.top_right,
+             surface.corner_radii.bottom_right, surface.corner_radii.bottom_left),
+      surface.clip_offset,
+      surface.clip_count,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+float rounded_rect_coverage(float2 point, float4 rect, float4 radii) {
+  float2 half_size = rect.zw * 0.5;
+  float2 center_to_point = point - (rect.xy + half_size);
+  float corner_radius = center_to_point.x < 0.0
+      ? (center_to_point.y < 0.0 ? radii.x : radii.w)
+      : (center_to_point.y < 0.0 ? radii.y : radii.z);
+  float2 corner_to_point = fabs(center_to_point) - half_size;
+  float2 corner_center_to_point = corner_to_point + corner_radius;
+  float distance = quad_sdf_impl(corner_center_to_point, corner_radius);
+  return saturate(0.5 - distance);
+}
+
+float surface_clip_coverage(SurfaceFragmentInput input,
+                            constant SurfaceClip *clips) {
+  float coverage = rounded_rect_coverage(input.position.xy, input.surface_rect,
+                                         input.corner_radii);
+  for (uint index = 0; index < input.clip_count; ++index) {
+    SurfaceClip clip = clips[input.clip_offset + index];
+    float4 rect = float4(clip.bounds.origin.x, clip.bounds.origin.y,
+                         clip.bounds.size.width, clip.bounds.size.height);
+    float4 radii = float4(clip.corner_radii.top_left, clip.corner_radii.top_right,
+                          clip.corner_radii.bottom_right, clip.corner_radii.bottom_left);
+    coverage = min(coverage, rounded_rect_coverage(input.position.xy, rect, radii));
+  }
+  return coverage;
 }
 
 fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],
                                  texture2d<float> cb_cr_texture
-                                 [[texture(SurfaceInputIndex_CbCrTexture)]]) {
+                                 [[texture(SurfaceInputIndex_CbCrTexture)]],
+                                 constant SurfaceClip *clips
+                                 [[buffer(SurfaceInputIndex_Clips)]]) {
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
   const float4x4 ycbcrToRGBTransform =
       float4x4(float4(+1.0000f, +1.0000f, +1.0000f, +0.0000f),
@@ -899,7 +942,19 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
-  return ycbcrToRGBTransform * ycbcr;
+  float4 color = ycbcrToRGBTransform * ycbcr;
+  float coverage = surface_clip_coverage(input, clips);
+  return float4(color.rgb * coverage, color.a * coverage);
+}
+
+fragment float4 bgra_surface_fragment(
+    SurfaceFragmentInput input [[stage_in]],
+    texture2d<float> bgra_texture [[texture(SurfaceInputIndex_BgraTexture)]],
+    constant SurfaceClip *clips [[buffer(SurfaceInputIndex_Clips)]]) {
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  float4 color = bgra_texture.sample(texture_sampler, input.texture_position);
+  float coverage = surface_clip_coverage(input, clips);
+  return float4(color.rgb * coverage, color.a * coverage);
 }
 
 float4 hsla_to_rgba(Hsla hsla) {
