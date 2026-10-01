@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point, size,
 };
 use std::{
     fmt::Debug,
@@ -884,6 +884,10 @@ pub struct MacExternalImageFrame {
     pub pixel_format: u32,
     /// Shareable IOSurface-backed BGRA pixel buffer.
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    /// Physical portion of the backing containing this frame. This may be
+    /// smaller than the IOSurface while the compositor pads buffers during a
+    /// live resize.
+    pub content_size: Size<crate::DevicePixels>,
     /// Metal event signaled by the producer after its writes complete.
     pub producer_event: metal::SharedEvent,
     /// Required producer event value before sampling.
@@ -898,6 +902,9 @@ struct MacExternalImageLifecycle {
     imported: std::sync::atomic::AtomicBool,
     submitted: std::sync::atomic::AtomicBool,
     outstanding_submissions: std::sync::atomic::AtomicUsize,
+    cancelled: std::sync::atomic::AtomicBool,
+    retired: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(target_os = "macos")]
@@ -923,6 +930,7 @@ impl std::fmt::Debug for MacExternalImageFrame {
             .field("pixel_format", &self.pixel_format)
             .field("width", &self.image_buffer.get_width())
             .field("height", &self.image_buffer.get_height())
+            .field("content_size", &self.content_size)
             .field("producer_value", &self.producer_value)
             .finish_non_exhaustive()
     }
@@ -930,6 +938,23 @@ impl std::fmt::Debug for MacExternalImageFrame {
 
 #[cfg(target_os = "macos")]
 impl MacExternalImageFrame {
+    fn trace_lease(&self, state: &str, detail: std::fmt::Arguments<'_>) {
+        if std::env::var_os("EXTERNAL_IMAGE_LEASE_TRACE").is_none() {
+            return;
+        }
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let elapsed = EPOCH.get_or_init(std::time::Instant::now).elapsed();
+        eprintln!(
+            "[external-image-lease +{}us] backing_id={} generation={} frame_id={} state={} {}",
+            elapsed.as_micros(),
+            self.backing_id,
+            self.generation,
+            self.frame_id,
+            state,
+            detail
+        );
+    }
+
     /// Creates a frame lease for an IOSurface backing.
     pub fn new(
         backing_id: u64,
@@ -942,6 +967,38 @@ impl MacExternalImageFrame {
         producer_value: u64,
         on_gpu_complete: impl Fn() + Send + Sync + 'static,
     ) -> Self {
+        let content_size = size(
+            crate::DevicePixels(image_buffer.get_width() as i32),
+            crate::DevicePixels(image_buffer.get_height() as i32),
+        );
+        Self::new_with_content_size(
+            backing_id,
+            generation,
+            frame_id,
+            iosurface_identity,
+            pixel_format,
+            image_buffer,
+            content_size,
+            producer_event,
+            producer_value,
+            on_gpu_complete,
+        )
+    }
+
+    /// Creates a frame whose visible content occupies the top-left portion of
+    /// a larger persistent IOSurface backing.
+    pub fn new_with_content_size(
+        backing_id: u64,
+        generation: u64,
+        frame_id: u64,
+        iosurface_identity: usize,
+        pixel_format: u32,
+        image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+        content_size: Size<crate::DevicePixels>,
+        producer_event: metal::SharedEvent,
+        producer_value: u64,
+        on_gpu_complete: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
         assert_ne!(backing_id, 0, "external image backing ID must be nonzero");
         assert_ne!(generation, 0, "external image generation must be nonzero");
         assert_ne!(frame_id, 0, "external image frame ID must be nonzero");
@@ -949,13 +1006,17 @@ impl MacExternalImageFrame {
             iosurface_identity, 0,
             "external image IOSurface must be valid"
         );
-        Self {
+        assert!(content_size.width.0 > 0 && content_size.height.0 > 0);
+        assert!(content_size.width.0 <= image_buffer.get_width() as i32);
+        assert!(content_size.height.0 <= image_buffer.get_height() as i32);
+        let frame = Self {
             backing_id,
             generation,
             frame_id,
             iosurface_identity,
             pixel_format,
             image_buffer,
+            content_size,
             producer_event,
             producer_value,
             on_gpu_complete: std::sync::Arc::new(on_gpu_complete),
@@ -963,20 +1024,33 @@ impl MacExternalImageFrame {
                 imported: std::sync::atomic::AtomicBool::new(false),
                 submitted: std::sync::atomic::AtomicBool::new(false),
                 outstanding_submissions: std::sync::atomic::AtomicUsize::new(0),
+                cancelled: std::sync::atomic::AtomicBool::new(false),
+                retired: std::sync::atomic::AtomicBool::new(false),
+                released: std::sync::atomic::AtomicBool::new(false),
             }),
-        }
+        };
+        frame.trace_lease(
+            "CREATED",
+            format_args!(
+                "signal_value={producer_value} iosurface_identity={iosurface_identity:#x}"
+            ),
+        );
+        frame
     }
 
     /// Returns whether GPUI's sampling command buffer released this lease.
     pub fn is_released(&self) -> bool {
         self.lifecycle
+            .released
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Returns whether this frame has been referenced by at least one GPUI
+    /// command buffer.
+    pub fn is_submitted(&self) -> bool {
+        self.lifecycle
             .submitted
             .load(std::sync::atomic::Ordering::Acquire)
-            && self
-                .lifecycle
-                .outstanding_submissions
-                .load(std::sync::atomic::Ordering::Acquire)
-                == 0
     }
 
     #[doc(hidden)]
@@ -984,10 +1058,18 @@ impl MacExternalImageFrame {
         self.lifecycle
             .imported
             .store(true, std::sync::atomic::Ordering::Release);
+        self.trace_lease("IMPORTED", format_args!(""));
     }
 
     #[doc(hidden)]
     pub fn mark_submitted(&self) {
+        debug_assert!(
+            !self
+                .lifecycle
+                .cancelled
+                .load(std::sync::atomic::Ordering::Acquire),
+            "cancelled external image lease was submitted"
+        );
         debug_assert!(
             self.lifecycle
                 .imported
@@ -1000,6 +1082,17 @@ impl MacExternalImageFrame {
         self.lifecycle
             .outstanding_submissions
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.trace_lease(
+            "GPUI_SUBMITTED",
+            format_args!(
+                "signal_value={} iosurface_identity={:#x} outstanding_submissions={}",
+                self.producer_value,
+                self.iosurface_identity,
+                self.lifecycle
+                    .outstanding_submissions
+                    .load(std::sync::atomic::Ordering::Acquire)
+            ),
+        );
     }
 
     #[doc(hidden)]
@@ -1013,7 +1106,77 @@ impl MacExternalImageFrame {
             result.is_ok(),
             "external image completion after release or before submission"
         );
-        (self.on_gpu_complete)();
+        self.trace_lease(
+            "GPU_COMPLETE",
+            format_args!(
+                "outstanding_submissions={}",
+                self.lifecycle
+                    .outstanding_submissions
+                    .load(std::sync::atomic::Ordering::Acquire)
+            ),
+        );
+        if result == Ok(1)
+            && self
+                .lifecycle
+                .retired
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.release_once();
+        }
+    }
+
+    /// Cancels a frame that was superseded before any GPUI command buffer
+    /// submitted it. The producer can immediately reuse its backing.
+    pub fn release_unsubmitted(&self) {
+        assert!(
+            !self
+                .lifecycle
+                .submitted
+                .load(std::sync::atomic::Ordering::Acquire),
+            "submitted external image lease cannot be cancelled"
+        );
+        self.lifecycle
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.trace_lease("CANCELLED_UNSUBMITTED", format_args!(""));
+        self.retire();
+    }
+
+    /// Marks the frame as no longer referenced by the current scene. Its
+    /// producer lease is released once all submitted sampling command buffers
+    /// have completed.
+    pub fn retire(&self) {
+        self.lifecycle
+            .retired
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.trace_lease(
+            "RETIRED",
+            format_args!(
+                "outstanding_submissions={}",
+                self.lifecycle
+                    .outstanding_submissions
+                    .load(std::sync::atomic::Ordering::Acquire)
+            ),
+        );
+        if self
+            .lifecycle
+            .outstanding_submissions
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            self.release_once();
+        }
+    }
+
+    fn release_once(&self) {
+        if !self
+            .lifecycle
+            .released
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.trace_lease("RELEASED", format_args!(""));
+            (self.on_gpu_complete)();
+        }
     }
 }
 

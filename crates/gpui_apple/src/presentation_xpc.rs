@@ -157,6 +157,17 @@ impl MacPresentationEventChannel {
         channel_id: &str,
         consumer_device: &DeviceRef,
     ) -> Result<SharedEvent> {
+        self.import_shared_event_with_identity(channel_id, consumer_device)
+            .map(|(event, _)| event)
+    }
+
+    /// Imports the persistent producer event and returns the producer device
+    /// registry ID advertised with its XPC handle.
+    pub fn import_shared_event_with_identity(
+        &self,
+        channel_id: &str,
+        consumer_device: &DeviceRef,
+    ) -> Result<(SharedEvent, u64)> {
         let channel_id =
             CString::new(channel_id).context("presentation channel ID contains NUL")?;
         let mut producer_registry_id = 0;
@@ -180,7 +191,7 @@ impl MacPresentationEventChannel {
         if event.is_null() {
             bail!("GPUI Metal device could not recreate the XPC shared-event handle");
         }
-        Ok(unsafe { SharedEvent::from_ptr(event) })
+        Ok((unsafe { SharedEvent::from_ptr(event) }, producer_registry_id))
     }
 
     /// Test/protocol hook: wait until the consumer has submitted a command

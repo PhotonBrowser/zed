@@ -25,7 +25,15 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{
+    cell::Cell,
+    ffi::{CStr, c_char, c_void},
+    mem,
+    mem::MaybeUninit,
+    ops::Range,
+    ptr, slice,
+    sync::Arc,
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -40,6 +48,14 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+
+fn trace_external_image_render(detail: std::fmt::Arguments<'_>) {
+    if std::env::var_os("EXTERNAL_IMAGE_LEASE_TRACE").is_some() {
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let elapsed = EPOCH.get_or_init(std::time::Instant::now).elapsed();
+        eprintln!("[GPUI Metal +{}us] {detail}", elapsed.as_micros());
+    }
+}
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -132,8 +148,10 @@ pub struct MetalRenderer {
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
-    external_surface_textures:
-        std::collections::HashMap<(u64, u64), core_video::metal_texture::CVMetalTexture>,
+    external_surface_textures: std::collections::HashMap<
+        (u64, u64, usize),
+        core_video::metal_texture::CVMetalTexture,
+    >,
     external_surface_texture_imports: usize,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
@@ -153,6 +171,19 @@ pub struct PathRasterizationVertex {
 }
 
 impl MetalRenderer {
+    /// Returns the identity of the IOSurface referenced by a CoreVideo pixel
+    /// buffer. Backing IDs may be recycled when a WebContent backing pool is
+    /// replaced, so texture caches must include the actual IOSurface identity.
+    pub fn iosurface_identity(image_buffer: &core_video::pixel_buffer::CVPixelBuffer) -> Result<usize> {
+        use core_video::pixel_buffer_io_surface::CVPixelBufferGetIOSurface;
+
+        let iosurface = unsafe { CVPixelBufferGetIOSurface(image_buffer.as_concrete_TypeRef()) };
+        anyhow::ensure!(!iosurface.is_null(), "pixel buffer has no IOSurface backing");
+        let identity = unsafe { io_surface::IOSurfaceGetID(iosurface) };
+        anyhow::ensure!(identity != 0, "IOSurface has an invalid identity");
+        Ok(identity as usize)
+    }
+
     /// Builds the persistent, IPC-facing descriptor for an IOSurface backing.
     /// The returned Mach send right is owned by the descriptor and must be
     /// transferred as an attachment (never as its numeric port name).
@@ -747,10 +778,23 @@ impl MetalRenderer {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
             drawable.present();
+            trace_external_image_render(format_args!(
+                "command_buffer={} drawable_present_scheduled=transaction",
+                command_buffer.label()
+            ));
         } else {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
+            trace_external_image_render(format_args!(
+                "command_buffer={} drawable_present_scheduled=command_buffer",
+                command_buffer.label()
+            ));
         }
+        trace_external_image_render(format_args!(
+            "command_buffer={} committed status={:?}",
+            command_buffer.label(),
+            command_buffer.status()
+        ));
     }
 
     fn render_frame(
@@ -759,6 +803,10 @@ impl MetalRenderer {
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
+        static NEXT_RENDER_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let render_id = NEXT_RENDER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let render_label = format!("GPUI external render {render_id}");
         let mut writer = InstanceBufferWriter::new(
             &self.device,
             &self.instance_buffer_pool,
@@ -782,7 +830,17 @@ impl MetalRenderer {
             &mut writer,
             texture,
             viewport_size,
+            render_id,
         )?;
+        command_buffer.set_label(&render_label);
+        trace_external_image_render(format_args!(
+            "command_buffer={render_label} webview_draw_encoded external_frames={}",
+            scene
+                .surfaces
+                .iter()
+                .filter(|surface| surface.external_image.is_some())
+                .count()
+        ));
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
@@ -797,10 +855,35 @@ impl MetalRenderer {
             .filter_map(|surface| surface.external_image.as_ref())
             .cloned()
             .collect::<Vec<_>>();
-        let block = ConcreteBlock::new(move |_| {
+        let block = ConcreteBlock::new(move |completed_buffer: &metal::CommandBufferRef| {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
             }
+            let error: *mut objc::runtime::Object = unsafe { msg_send![completed_buffer, error] };
+            let error_description = if error.is_null() {
+                "none".to_string()
+            } else {
+                let description: *mut objc::runtime::Object =
+                    unsafe { msg_send![error, localizedDescription] };
+                if description.is_null() {
+                    "unavailable".to_string()
+                } else {
+                    let utf8: *const c_char = unsafe { msg_send![description, UTF8String] };
+                    if utf8.is_null() {
+                        "unavailable".to_string()
+                    } else {
+                        unsafe { CStr::from_ptr(utf8) }
+                            .to_string_lossy()
+                            .into_owned()
+                    }
+                }
+            };
+            trace_external_image_render(format_args!(
+                "command_buffer={} completed status={:?} error={:?}",
+                completed_buffer.label(),
+                completed_buffer.status(),
+                error_description
+            ));
             for frame in &completion_frames {
                 frame.mark_gpu_complete();
             }
@@ -950,6 +1033,7 @@ impl MetalRenderer {
         writer: &mut InstanceBufferWriter,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
+        render_id: u64,
     ) -> Result<metal::CommandBuffer> {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
@@ -957,6 +1041,14 @@ impl MetalRenderer {
         // sample the external textures, before any render encoder is created.
         for surface in &scene.surfaces {
             if let Some(frame) = &surface.external_image {
+                trace_external_image_render(format_args!(
+                    "command_buffer=GPUI external render {render_id} frame={} generation={} IOSurface={:#x} wait_shared_event={} current_signaled_value={}",
+                    frame.frame_id,
+                    frame.generation,
+                    frame.iosurface_identity,
+                    frame.producer_value,
+                    frame.producer_event.signaled_value()
+                ));
                 command_buffer.encode_wait_for_event(&frame.producer_event, frame.producer_value);
             }
         }
@@ -1458,6 +1550,14 @@ impl MetalRenderer {
                 DevicePixels::from(surface.image_buffer.get_width() as i32),
                 DevicePixels::from(surface.image_buffer.get_height() as i32),
             );
+            let content_size = surface
+                .external_image
+                .as_ref()
+                .map_or(texture_size, |frame| frame.content_size);
+            let texture_dimensions = SurfaceTextureSize {
+                backing: texture_size,
+                content: content_size,
+            };
 
             if let Some(frame) = &surface.external_image {
                 assert_eq!(
@@ -1469,7 +1569,11 @@ impl MetalRenderer {
                     texture_size.height.0 as u64
                 );
                 command_encoder.set_render_pipeline_state(&self.bgra_surfaces_pipeline_state);
-                let key = (frame.backing_id, frame.generation);
+                let key = (
+                    frame.backing_id,
+                    frame.generation,
+                    frame.iosurface_identity,
+                );
                 if !self.external_surface_textures.contains_key(&key) {
                     let import_started = std::time::Instant::now();
                     let imported = self
@@ -1486,15 +1590,15 @@ impl MetalRenderer {
                     self.external_surface_textures.insert(key, imported);
                     self.external_surface_texture_imports += 1;
                     log::info!(
-                        "GPUI imported IOSurface backing={} generation={} ({}x{}, BGRA8) in {:.3}ms",
+                        "GPUI imported IOSurface backing={} generation={} identity={:#x} ({}x{}, BGRA8) in {:.3}ms",
                         frame.backing_id,
                         frame.generation,
+                        frame.iosurface_identity,
                         texture_size.width.0,
                         texture_size.height.0,
                         import_started.elapsed().as_secs_f64() * 1000.0
                     );
                 }
-                frame.mark_imported();
                 let imported = self.external_surface_textures.get(&key).unwrap();
                 let raw_texture =
                     unsafe { CVMetalTextureGetTexture(imported.as_concrete_TypeRef()) };
@@ -1506,10 +1610,15 @@ impl MetalRenderer {
                     SurfaceInputIndex::BgraTexture as u64,
                     Some(unsafe { metal::TextureRef::from_ptr(raw_texture as *mut _) }),
                 );
+                frame.mark_imported();
+                trace_external_image_render(format_args!(
+                    "frame={} generation={} IOSurface={:#x} texture_resolved=true",
+                    frame.frame_id, frame.generation, frame.iosurface_identity
+                ));
                 command_encoder.set_vertex_bytes(
                     SurfaceInputIndex::TextureSize as u64,
-                    mem::size_of_val(&texture_size) as u64,
-                    &texture_size as *const Size<DevicePixels> as *const _,
+                    mem::size_of_val(&texture_dimensions) as u64,
+                    &texture_dimensions as *const SurfaceTextureSize as *const _,
                 );
                 command_encoder.draw_primitives_instanced_base_instance(
                     metal::MTLPrimitiveType::Triangle,
@@ -1552,8 +1661,8 @@ impl MetalRenderer {
 
             command_encoder.set_vertex_bytes(
                 SurfaceInputIndex::TextureSize as u64,
-                mem::size_of_val(&texture_size) as u64,
-                &texture_size as *const Size<DevicePixels> as *const _,
+                mem::size_of_val(&texture_dimensions) as u64,
+                &texture_dimensions as *const SurfaceTextureSize as *const _,
             );
             // let y_texture = y_texture.get_texture().unwrap().
             command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
@@ -1975,6 +2084,12 @@ enum SurfaceInputIndex {
 }
 
 #[repr(C)]
+struct SurfaceTextureSize {
+    backing: Size<DevicePixels>,
+    content: Size<DevicePixels>,
+}
+
+#[repr(C)]
 enum PathRasterizationInputIndex {
     Vertices = 0,
     ViewportSize = 1,
@@ -2204,7 +2319,7 @@ impl MetalHeadlessRenderer {
         let before = self.renderer.external_surface_textures.len();
         self.renderer
             .external_surface_textures
-            .retain(|(_, cached_generation), _| *cached_generation != generation);
+            .retain(|(_, cached_generation, _), _| *cached_generation != generation);
         before - self.renderer.external_surface_textures.len()
     }
 
@@ -2280,6 +2395,7 @@ mod external_image_tests {
         let image = renderer
             .render_scene_to_image(&scene, size(DevicePixels(800), DevicePixels(500)))
             .unwrap();
+        lease.retire();
         assert_eq!(image.get_pixel(100, 100).0, [255, 0, 0, 255]);
         assert_eq!(image.get_pixel(700, 100).0, [0, 255, 0, 255]);
         assert_eq!(image.get_pixel(100, 400).0, [0, 0, 255, 255]);
@@ -2326,6 +2442,26 @@ mod external_image_tests {
             imported_buffer.get_height(),
             frame.image_buffer.get_height()
         );
+    }
+
+    #[test]
+    fn external_texture_cache_distinguishes_replaced_iosurface_with_same_ids() {
+        let first = MetalRenderer::create_standalone_test_frame(64, 64, 90, 1, 1).unwrap();
+        let second = MetalRenderer::create_standalone_test_frame(64, 64, 90, 1, 2).unwrap();
+        assert_ne!(first.iosurface_identity, second.iosurface_identity);
+
+        let mut renderer = MetalHeadlessRenderer::new();
+        for frame in [first, second] {
+            let mut scene = Scene::default();
+            insert_external_frame(&mut scene, frame);
+            scene.finish();
+            let _ = renderer
+                .render_scene_to_image(&scene, size(DevicePixels(64), DevicePixels(64)))
+                .unwrap();
+        }
+
+        assert_eq!(renderer.external_surface_texture_import_count(), 2);
+        assert_eq!(renderer.external_surface_texture_count(), 2);
     }
 
     #[test]
@@ -2444,6 +2580,7 @@ mod external_image_tests {
                     size(DevicePixels(width as i32), DevicePixels(height as i32)),
                 )
                 .unwrap();
+            lease.retire();
             assert_eq!(image.get_pixel(100, 100).0, [255, 0, 0, 255]);
             assert_eq!(
                 image.get_pixel((width - 100) as u32, 100).0,

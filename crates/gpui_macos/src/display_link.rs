@@ -59,10 +59,29 @@ use gpui_util::ResultExt;
 use std::{
     collections::{BTreeMap, btree_map},
     ffi::c_void,
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry::new());
+static EMBEDDED_HOST_WAKER: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+
+/// Notify an embedded JavaScript host when native main-queue work is ready.
+/// The callback must only schedule a host pump; it must not enter AppKit or GPUI.
+pub fn set_embedded_host_waker(waker: Option<Arc<dyn Fn() + Send + Sync>>) {
+    *EMBEDDED_HOST_WAKER
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = waker;
+}
+
+pub(crate) fn wake_embedded_host() {
+    let waker = EMBEDDED_HOST_WAKER
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    if let Some(waker) = waker {
+        waker();
+    }
+}
 
 struct Registry {
     displays: BTreeMap<CGDirectDisplayID, DisplayEntry>,
@@ -126,10 +145,16 @@ unsafe extern "C" fn display_link_output_callback(
 ) -> i32 {
     let display_id = display_id as usize as CGDirectDisplayID;
     let registry = lock_registry();
+    let mut queued = false;
     if let Some(entry) = registry.displays.get(&display_id) {
         for (_, frame_requests) in &entry.subscribers {
             frame_requests.merge_data(1);
+            queued = true;
         }
+    }
+    drop(registry);
+    if queued {
+        wake_embedded_host();
     }
     0
 }

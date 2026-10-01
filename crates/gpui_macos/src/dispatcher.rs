@@ -57,6 +57,7 @@ impl PlatformDispatcher for MacDispatcher {
         unsafe {
             DispatchQueue::main().exec_async_f(context, trampoline);
         }
+        crate::wake_embedded_host();
     }
 
     fn dispatch_after(&self, duration: Duration, runnable: RunnableVariant) {

@@ -56,6 +56,7 @@ pub(crate) use window::*;
 pub(crate) use text_system::*;
 
 pub use platform::MacPlatform;
+pub use display_link::set_embedded_host_waker;
 
 trait BoolExt {
     fn to_objc(self) -> BOOL;

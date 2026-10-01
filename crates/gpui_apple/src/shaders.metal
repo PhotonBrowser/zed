@@ -869,13 +869,18 @@ struct SurfaceFragmentInput {
   uint clip_count [[flat]];
 };
 
+struct SurfaceTextureSize {
+  Size_DevicePixels backing;
+  Size_DevicePixels content;
+};
+
 vertex SurfaceVertexOutput surface_vertex(
     uint unit_vertex_id [[vertex_id]], uint surface_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(SurfaceInputIndex_Vertices)]],
     constant SurfaceBounds *surfaces [[buffer(SurfaceInputIndex_Surfaces)]],
     constant Size_DevicePixels *viewport_size
     [[buffer(SurfaceInputIndex_ViewportSize)]],
-    constant Size_DevicePixels *texture_size
+    constant SurfaceTextureSize *texture_size
     [[buffer(SurfaceInputIndex_TextureSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   SurfaceBounds surface = surfaces[surface_id];
@@ -885,7 +890,9 @@ vertex SurfaceVertexOutput surface_vertex(
                                                  surface.content_mask.bounds);
   // We are going to copy the whole texture, so the texture position corresponds
   // to the current vertex of the unit triangle.
-  float2 texture_position = unit_vertex;
+  float2 texture_position = unit_vertex *
+      float2(float(texture_size->content.width) / float(texture_size->backing.width),
+             float(texture_size->content.height) / float(texture_size->backing.height));
   return SurfaceVertexOutput{
       device_position,
       texture_position,

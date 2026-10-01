@@ -24,7 +24,9 @@ use core_foundation::{
     boolean::CFBoolean,
     data::CFData,
     dictionary::{CFDictionary, CFDictionaryRef, CFMutableDictionary},
-    runloop::{CFRunLoopRun, CFRunLoopRunInMode, kCFRunLoopDefaultMode},
+    runloop::{
+        CFRunLoopRun, CFRunLoopRunInMode, kCFRunLoopDefaultMode, kCFRunLoopRunHandledSource,
+    },
     string::{CFString, CFStringRef},
 };
 use ctor::ctor;
@@ -642,7 +644,16 @@ unsafe fn pump_app_nonblocking() {
             let _: () = msg_send![app, sendEvent: event];
         }
         let _: () = msg_send![app, updateWindows];
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 1);
+        // A native wake can queue more than one main-queue source. In
+        // particular, draining only the first source can leave the display
+        // link's window draw waiting until the next host tick.
+        for _ in 0..32 {
+            if CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 1)
+                != kCFRunLoopRunHandledSource
+            {
+                break;
+            }
+        }
     }
 }
 

@@ -388,6 +388,7 @@ fn run_consumer(device: &Device, channel: &Arc<MacPresentationEventChannel>, cha
             capture.save(&screenshot).unwrap();
             println!("GPUI cross-process capture: {}", screenshot.display());
         }
+        lease.retire();
         assert!(lease.is_released(), "GPUI completion did not release frame");
         assert!(
             released.load(Ordering::Acquire),
